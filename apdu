@@ -1,0 +1,293 @@
+#!/usr/bin/env python
+
+# APDU shell
+#
+# Copyright (c) 2014 Goran Rakic <grakic@devbase.net>
+
+import sys, os, stat
+import getopt
+from threading import Thread, Event
+from subprocess import Popen, PIPE
+from fcntl import fcntl, F_GETFL, F_SETFL
+from smartcard.System import readers
+from smartcard.CardRequest import CardRequest
+from smartcard.util import *
+
+VERSION = "1.0"
+HELLO = "APDU shell v%s" % VERSION
+
+
+def print_clear(message, f=sys.stdout):
+    pass
+    # print >> f, "\n" + message + "\n>> ",
+    # f.flush() 
+
+def error(e, lineno = None):
+    out = "   Error"
+    if lineno is not None:
+        out += " on line %d" % lineno
+    out += ": " + str(e)
+    return out
+
+class Connection(object):
+
+    __connection = None
+
+    class Monitoring(Thread):
+
+        def __init__(self, observer, reader):
+            Thread.__init__(self)
+            self.reader = reader
+            self.observer = observer
+            self.stopEvent = Event()
+            self.stopEvent.clear()
+            self.setDaemon(True)
+            self.card = None
+
+        def run(self):
+            self.cardrequest = CardRequest(timeout=1, readers=[reader])
+            while not self.stopEvent.isSet():
+                try:
+                    card = self.cardrequest.waitforcardevent()
+                    if card != self.card:
+                        if not card:                    
+                            self.observer.removed()
+                        else:
+                            self.observer.inserted(card[0])
+                    self.card = card
+                except Exception as e:
+                    print_clear("Error: %s" % e, f=sys.stderr)
+
+    def __init__(self, reader, interactive = True):
+        self.interactive = interactive
+        self.monitoring = Connection.Monitoring(self, reader)
+        self.monitoring.start()
+
+    def inserted(self, card):
+        self.__connection = card.createConnection()
+        self.__connection.connect()
+        if self.interactive:
+            print_clear("Card connected: %s" % toHexString(card.atr))
+
+    def removed(self):
+        self.__connection = None
+        if self.interactive:
+            print_clear("Card removed")
+
+    def send(self, apdu, output=None, display_sent=None):
+         if not self.__connection:
+             raise Exception("Card not connected")
+
+         # print input
+         if display_sent is None:
+            display_sent = not self.interactive
+         if display_sent:         
+             print ">> %s" % toHexString(apdu)
+
+         data, sw1, sw2 = self.__connection.transmit(apdu)
+
+         # print output and data
+         print "<< %02X %02X%s" % (sw1, sw2, ", %d bytes" % len(data) if data else "")
+         if data:
+             if output:
+                 # save data
+                 with open(output, "w+") as f:
+                     f.write(toByteString(data))
+                 print "   Output saved to %s" % output
+             else:
+                 # pack 8 bits into bytes, write 4 bytes per line
+                 bytes = [toHexString(data[i:i+8]) for i in range(0, len(data), 8)]
+                 print "\n".join(["   "+"  ".join(bytes[i:i+4]) for i in range(0, len(bytes), 4)])
+
+         # return response
+         return toHexString(data + [sw1, sw2])
+
+    def close(self):
+        self.monitoring.stopEvent.set()
+        self.connection = None
+
+def run(connection, command):
+    p = Popen(command, stdin = PIPE, stdout = PIPE, stderr = PIPE, shell = True)
+    lineno = 0
+    while True:
+        try:
+            lineno += 1
+            line = os.read(p.stdout.fileno(), 1024).strip()
+            try:
+                apdu, output = parse(line)
+            except Exception as e:
+                raise Exception("invalid command output '%s' on line %d: %s" % toHexString(line), lineno, e)
+
+            response = connection.send(apdu, output, display_sent=True)
+
+            p.stdin.write(response)
+        except IOError as e:
+            break
+
+def parse(line):
+    apdu = []
+    line, _, output = line.partition('>')
+    line = line.split(' ')
+    for part in line:
+        if len(part) % 2 == 0:
+            apdu.extend([int(part[2*i:2*i+2], 16) for i in range(len(part)/2)])
+        elif len(part) == 1:
+            apdu.append(int(part, 16))
+        else:
+            raise ValueError("invalid literal: %s" % part)
+    output = output.strip()
+    return apdu, output or None
+
+def select_reader(name=None, index=None):
+    readers_all = readers()
+    if index is None:
+        for reader in readers_all:
+            if name in str(reader):
+                return reader
+        raise Exception("Unknown reader %s" % name)
+    else:
+        if index < len(readers_all):
+            return readers_all[index]
+        else:
+            raise Exception("Unknown reader number #%d" % index)
+
+def list_readers():
+    print "Listing readers:"
+    for i, reader in enumerate(readers()):
+        reader = str(reader)
+        print " #%d" % i, reader[:60], "..." if len(reader)>60 else ""
+    print
+    print "Use -r <num index> or -r <part of the name> to select non-default reader."
+
+def usage():
+    print """
+%s
+
+Usage: %s [options]
+
+    -l, --list    
+        List all PC/SC readers
+
+    -r <reader>, --reader <reader>
+        Select a reader where <reader> is either numeric index starting
+        at 0 or a part of the reader name. Default: reader with index 0
+
+    -h, --help
+        Display this help message
+""" % (HELLO, sys.argv[0])
+
+
+if __name__ == "__main__":
+
+    reader = None
+
+    # Parse options
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "hr:l", ["help", "reader=", "list"])
+    except getopt.GetoptError as e:
+        print >> sys.stderr, str(e)
+        usage()
+        sys.exit(2)
+    for o, a in opts:
+        if o in ("-r", "--reader"):
+            reader = a
+        elif o in ("-h", "--help"):
+            usage()
+            sys.exit()
+        elif o in ("-l", "--list"):
+            list_readers()
+            sys.exit()
+
+    # Check TTY interactivity
+    mode = os.fstat(0).st_mode
+    interactive = not (stat.S_ISFIFO(mode) or stat.S_ISREG(mode))
+
+    # Welcome message
+    if interactive:
+        import readline
+        print """
+%s
+
+Type APDU as hex string. Append '> <file>' to save data output to a file. Comments starts with a '#'.
+RUN <command> runs an external command, executing APDUs from command output and passing full response
+to input. Use SAVE <file> to save command history, CLEAR to clear it.
+
+""" % HELLO
+
+    # Connect reader
+    try:
+        if not reader:
+            reader = select_reader(index=0)
+        elif reader.isdigit():
+            reader = select_reader(index=int(reader))
+        else:
+            reader = select_reader(reader)
+
+        connection = Connection(reader, interactive)
+
+    except Exception as e:
+        print >> sys.stderr, str(e)
+        sys.exit(1)
+    
+    # Launch "REPL"
+    history = []
+    lineno = 0
+    try:
+        while True:
+            lineno += 1
+            line, _, comment = raw_input("\b>> " if interactive else "").strip().partition("#")
+            line, comment = line.strip(), comment.strip()
+
+            if comment and not interactive:
+                print "# ", comment
+
+            if line:
+
+                # save command
+                if line.lower().startswith("save"):
+                    try:
+                        filename = line[4:].strip()
+                        with open(filename, "w+") as f:
+                            f.writelines([l+("# "+c if c else "")+"\n" for l,c in history])
+                        print "   History saved to %s" % filename, interactive
+                    except IOError as e:
+                        print >> sys.stderr, error(e, lineno if not interactive else None)
+                    continue
+
+                # clear command
+                elif line.lower().startswith("clear"):
+                    history = []
+                    echo_message("History cleared", interactive)
+                    continue
+
+                # run external process
+                elif line.lower().startswith("run"):
+                    try:
+                        command = line[3:].strip()
+                        run(connection, command)
+                    except Exception as e:
+                        print >> sys.stderr, error(e, lineno if not interactive else None)
+                        
+                # run apdu
+                else:
+                    try:
+                        apdu, output = parse(line)
+                        connection.send(apdu, output)
+                    except Exception as e:
+                        if type(e) == ValueError and "invalid literal" in str(e):
+                            print >> sys.stderr, error("Input error at %s" % str(e)[-4:], lineno if not interactive else None)
+                        else:
+                            print >> sys.stderr, error(e, lineno if not interactive else None)
+                        continue
+    
+            # save history, skipping lines with errors
+            history.append((line, comment))
+
+            sys.stdout.flush()
+
+    except (KeyboardInterrupt, EOFError):
+        if interactive:
+            print
+        connection.close()
+        sys.exit()
+
