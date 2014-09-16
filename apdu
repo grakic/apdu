@@ -6,6 +6,7 @@
 
 import sys, os, stat
 import getopt
+from time import sleep
 from threading import Thread, Event
 from subprocess import Popen, PIPE
 from fcntl import fcntl, F_GETFL, F_SETFL
@@ -41,11 +42,13 @@ class Connection(object):
             self.observer = observer
             self.stopEvent = Event()
             self.stopEvent.clear()
+            self.initializedEvent = Event()
+            self.initializedEvent.clear()
             self.setDaemon(True)
             self.card = None
 
         def run(self):
-            self.cardrequest = CardRequest(timeout=1, readers=[reader])
+            self.cardrequest = CardRequest(timeout=0.5, readers=[reader])
             while not self.stopEvent.isSet():
                 try:
                     card = self.cardrequest.waitforcardevent()
@@ -55,6 +58,7 @@ class Connection(object):
                         else:
                             self.observer.inserted(card[0])
                     self.card = card
+                    self.initializedEvent.set()
                 except Exception as e:
                     print_clear("Error: %s" % e, f=sys.stderr)
 
@@ -62,6 +66,8 @@ class Connection(object):
         self.interactive = interactive
         self.monitoring = Connection.Monitoring(self, reader)
         self.monitoring.start()
+        while not self.monitoring.initializedEvent.isSet():
+            sleep(0.1)
 
     def inserted(self, card):
         self.__connection = card.createConnection()
@@ -92,7 +98,7 @@ class Connection(object):
              if output:
                  # save data
                  with open(output, "w+") as f:
-                     f.write(toByteString(data))
+                     f.write(HexListToBinString(data))
                  print "   Output saved to %s" % output
              else:
                  # pack 8 bits into bytes, write 4 bytes per line
