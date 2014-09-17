@@ -17,12 +17,6 @@ from smartcard.util import *
 VERSION = "1.0"
 HELLO = "APDU shell v%s" % VERSION
 
-
-def print_clear(message, f=sys.stdout):
-    pass
-    # print >> f, "\n" + message + "\n>> ",
-    # f.flush() 
-
 def error(e, lineno = None):
     out = "   Error"
     if lineno is not None:
@@ -60,10 +54,9 @@ class Connection(object):
                     self.card = card
                     self.initializedEvent.set()
                 except Exception as e:
-                    print_clear("Error: %s" % e, f=sys.stderr)
+                    print >> sys.stderr, "Connection error:", e
 
-    def __init__(self, reader, interactive = True):
-        self.interactive = interactive
+    def __init__(self, reader):
         self.monitoring = Connection.Monitoring(self, reader)
         self.monitoring.start()
         while not self.monitoring.initializedEvent.isSet():
@@ -72,22 +65,18 @@ class Connection(object):
     def inserted(self, card):
         self.__connection = card.createConnection()
         self.__connection.connect()
-        if self.interactive:
-            print_clear("Card connected: %s" % toHexString(card.atr))
+        # print "Card connected: %s" % toHexString(card.atr)
 
     def removed(self):
         self.__connection = None
-        if self.interactive:
-            print_clear("Card removed")
+        # print "Card removed"
 
-    def send(self, apdu, output=None, display_sent=None):
+    def send(self, apdu, output=None, show_sent=True):
          if not self.__connection:
              raise Exception("Card not connected")
 
          # print input
-         if display_sent is None:
-            display_sent = not self.interactive
-         if display_sent:         
+         if show_sent:         
              print ">> %s" % toHexString(apdu)
 
          data, sw1, sw2 = self.__connection.transmit(apdu)
@@ -106,29 +95,20 @@ class Connection(object):
                  print "\n".join(["   "+"  ".join(bytes[i:i+4]) for i in range(0, len(bytes), 4)])
 
          # return response
-         return toHexString(data + [sw1, sw2])
+         return data + [sw1, sw2]
 
     def close(self):
         self.monitoring.stopEvent.set()
         self.connection = None
 
-def run(connection, command):
-    p = Popen(command, stdin = PIPE, stdout = PIPE, stderr = PIPE, shell = True)
-    lineno = 0
-    while True:
-        try:
-            lineno += 1
-            line = os.read(p.stdout.fileno(), 1024).strip()
-            try:
-                apdu, output = parse(line)
-            except Exception as e:
-                raise Exception("invalid command output '%s' on line %d: %s" % toHexString(line), lineno, e)
-
-            response = connection.send(apdu, output, display_sent=True)
-
-            p.stdin.write(response)
-        except IOError as e:
-            break
+def hexByteToInt(byte):
+    try:
+        return int(byte, 16)
+    except ValueError as e:
+        if "invalid literal" in str(e):
+            raise ValueError("Input error at %s" % str(e)[-4:])
+        else:
+            raise
 
 def parse(line):
     apdu = []
@@ -136,13 +116,50 @@ def parse(line):
     line = line.split(' ')
     for part in line:
         if len(part) % 2 == 0:
-            apdu.extend([int(part[2*i:2*i+2], 16) for i in range(len(part)/2)])
+            apdu.extend([hexByteToInt(part[2*i:2*i+2]) for i in range(len(part)/2)])
         elif len(part) == 1:
-            apdu.append(int(part, 16))
+            apdu.append(hexByteToInt(part))
         else:
-            raise ValueError("invalid literal: %s" % part)
+            raise ValueError("Input error at: '%s'" % part)
+
     output = output.strip()
     return apdu, output or None
+
+def repl_cmd_run(connection, command, lineno, interactive):
+    p = Popen(command, stdin = PIPE, stdout = PIPE, stderr = PIPE, shell = True, bufsize=0)
+    command_lineno = 0
+    while True:
+        command_lineno += 1
+
+        raw_line = p.stdout.readline()
+        if not raw_line and p.returncode is not None:
+            if p.returncode == 0:
+                print "   Command completed successfully"
+                return
+            else:
+                raise Exception("Command exited with status %d" % p.returncode)
+
+        line, _, comment = raw_line.partition("#")
+        line, comment = line.strip(), comment.strip()
+
+        if comment:
+            print "##", comment
+
+        if line:
+            try:
+                apdu, output = parse(line)
+                response = connection.send(apdu, output, True)
+            except Exception as e:
+                error = "While executing output line %d: '%s'" % (command_lineno, raw_line)
+                if not interactive:
+                    error += " from command %s on line %d" % (command, lineno)
+                error += ":\n   %s" % e
+                raise Exception(error)
+            
+            p.stdin.write(toHexString(response) + "\n")
+            p.stdin.flush()
+
+        p.poll()
 
 def select_reader(name=None, index=None):
     readers_all = readers()
@@ -229,7 +246,7 @@ to input. Use SAVE <file> to save command history, CLEAR to clear it.
         else:
             reader = select_reader(reader)
 
-        connection = Connection(reader, interactive)
+        connection = Connection(reader)
 
     except Exception as e:
         print >> sys.stderr, str(e)
@@ -240,54 +257,50 @@ to input. Use SAVE <file> to save command history, CLEAR to clear it.
     lineno = 0
     try:
         while True:
+        
             lineno += 1
-            line, _, comment = raw_input("\b>> " if interactive else "").strip().partition("#")
+            save_history = True
+            
+            line, _, comment = raw_input(">> " if interactive else "").partition("#")
             line, comment = line.strip(), comment.strip()
 
             if comment and not interactive:
-                print "# ", comment
+                print "##", comment
 
             if line:
+                try:
 
-                # save command
-                if line.lower().startswith("save"):
-                    try:
+                    # save command
+                    if line.lower().startswith("save"):
                         filename = line[4:].strip()
                         with open(filename, "w+") as f:
                             f.writelines([l+("# "+c if c else "")+"\n" for l,c in history])
                         print "   History saved to %s" % filename, interactive
-                    except IOError as e:
-                        print >> sys.stderr, error(e, lineno if not interactive else None)
-                    continue
+                        save_history = False
 
-                # clear command
-                elif line.lower().startswith("clear"):
-                    history = []
-                    echo_message("History cleared", interactive)
-                    continue
+                    # clear command
+                    elif line.lower().startswith("clear"):
+                        history = []
+                        echo_message("History cleared", interactive)
+                        save_history = False
 
-                # run external process
-                elif line.lower().startswith("run"):
-                    try:
+                    # run external process
+                    elif line.lower().startswith("run"):
                         command = line[3:].strip()
-                        run(connection, command)
-                    except Exception as e:
-                        print >> sys.stderr, error(e, lineno if not interactive else None)
-                        
-                # run apdu
-                else:
-                    try:
+                        repl_cmd_run(connection, command, lineno, interactive)
+
+                    # send apdu
+                    else:
                         apdu, output = parse(line)
-                        connection.send(apdu, output)
-                    except Exception as e:
-                        if type(e) == ValueError and "invalid literal" in str(e):
-                            print >> sys.stderr, error("Input error at %s" % str(e)[-4:], lineno if not interactive else None)
-                        else:
-                            print >> sys.stderr, error(e, lineno if not interactive else None)
-                        continue
-    
-            # save history, skipping lines with errors
-            history.append((line, comment))
+                        connection.send(apdu, output, not interactive)
+
+                except Exception as e:
+                    print >> sys.stderr, error(e, lineno if not interactive else None)
+                    save_history = False
+
+            # save history
+            if save_history:
+                history.append((line, comment))
 
             sys.stdout.flush()
 
