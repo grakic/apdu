@@ -1,0 +1,63 @@
+#!/usr/bin/env python
+
+# Save content from new Serbian eID card
+# 
+# Usage from APDU Shell:
+#   RUN ./cmd/rseid_new_readfile 0F02
+
+import sys
+
+def fromHex(hex_string):
+    return [int(x, 16) for x in hex_string.split(' ')]
+
+def bytes(hex_string, offset, count=1):
+    b = hex_string[offset*3 : (offset+count)*3-1]
+    return fromHex(b)
+
+def send(hex_string):
+    print hex_string
+    sys.stdout.flush()
+    response = raw_input()
+    return response[:-6], response[-5:]
+
+# select
+name = " ".join(sys.argv[1:])
+response, status = send("00 A4 00 00 02 %s 00" % name)
+if status != "90 00":
+    print "# Select failed: %s" % status
+    sys.exit(1)
+
+# get length from response - maximum allowed length
+x1, x2 = bytes(response, 2, 2)
+length = (x1<<8) + x2
+
+# read file
+content = []
+offset = 0
+known_real_length = False
+while length > 0:
+    next = min(length, 0xFF)
+    response, status = send("00 B0 %X %X %X" % ((offset>>8), (offset&0xFF), next))
+    if not status == "90 00":
+        if status == "69 82":
+            print "# Security status not satisfied"
+        else:
+            print "# Read failed: %s" % status
+        sys.exit(1)
+
+    if not known_real_length:
+         # get length from file, little endian at 2 bytes offset - ignore padding with zeros
+         x1, x2 = bytes(response, 2, 2)
+         length = (x2<<8) + x1 + 4
+         next = min(next, length)
+         known_real_length = True
+         print "# Reading %d bytes" % length
+
+    content += bytes(response, 0, next)
+    offset += next
+    length -= next
+
+filename = "%s.bin" % name.replace(' ','')
+with open(filename, "w+") as f:
+    f.write("".join([chr(x) for x in content[4:]]))
+print "# File saved as %s" % filename
