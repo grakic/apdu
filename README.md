@@ -52,3 +52,4 @@ There is also a <tt>CLEAR</tt> command to clear current history.
 - [OpenSCDP Smart Card Shell 3](http://www.openscdp.org/scsh3/)
 - [JSmartCardExplorer](http://www.primianotucci.com/os/smartcard-explorer)
 - Android APDU Sender: [Contact](https://play.google.com/store/apps/details?id=com.jmarroyo.apdusendercontact), [Contactless](https://play.google.com/store/apps/details?id=com.jmarroyo.apdusendercontactless)
+- [smacadu](http://www.literatecode.com/smacadu)
